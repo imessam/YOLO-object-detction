@@ -7,7 +7,6 @@ from torchvision import transforms, utils
 
 
 class VOCDataset(Dataset):
-    """Face Landmarks dataset."""
 
     def __init__(self, annotations, images_dirs, transform=None):
         """

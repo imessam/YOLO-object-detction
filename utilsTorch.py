@@ -17,6 +17,10 @@ idx2label = dict(enumerate(iter(classes)))
 label2idx = dict(zip(iter(idx2label.values()),iter(idx2label.keys()))) 
 eps = 1e-10
 
+new_size = (448,448)
+no_grids = 7
+no_classes = 20
+no_boxes = 2
 
 
 def resizeImage(image, newSize):
@@ -330,9 +334,24 @@ def iou_bb(boxA, boxB):
     return iou
 
 
+def iou_nms(boxA,boxB):
+        
+    xy_A,wh_A = boxA[:,:2],boxA[:,2:]
+    xy_B,wh_B = boxB[:2],boxB[2:]
+    
+    intersect_wh = torch.maximum(torch.zeros_like(wh_A), (wh_A + wh_B)/2 - torch.abs(xy_A - xy_B) )
+    intersect_area = intersect_wh[:,0] * intersect_wh[:,1]
+    
+    true_area = wh_B[0] * wh_B[1]
+    pred_area = wh_A[:,0] * wh_A[:,1]
+    
+    union_area = pred_area + true_area - intersect_area+eps
+    iou = intersect_area / union_area
+    
+    return iou
+
 def iou_ybb(boxA,boxB):
-    
-    
+        
     xy_A,wh_A = boxA[:2],boxA[2:]
     xy_B,wh_B = boxB[:2],boxB[2:]
     
@@ -348,9 +367,7 @@ def iou_ybb(boxA,boxB):
     return iou
 
 def iou_grid(gridA,gridB):
-    
-    
-    
+      
     xy_A,wh_A = gridA[0],gridA[1]
     xy_B,wh_B = gridB[0],gridB[1]
             
@@ -369,7 +386,7 @@ def iou_grid(gridA,gridB):
 
 
 
-def createLabelsFaster(data,new_size,no_grids,no_boxes,no_classes):
+def createLabels(data):
     
     grid_size = tuple([int(s/no_grids) for s in new_size])
     widthRange = [0,new_size[1]//1]
@@ -512,78 +529,103 @@ def yoloLoss(labels,predictions,lambda_coords,lambda_noobj):
     wh_loss = torch.sum(((torch.sqrt(real_wh) - torch.sqrt(pred_wh))**2)*real_conf.unsqueeze(4))*lambda_coords
 
     classes_loss = torch.sum(((real_classes - pred_classes)**2)*torch.max(real_conf,dim=3)[0].unsqueeze(3))
+    
+    obj_conf_loss = torch.sum(((real_conf-pred_conf)**2)*real_conf)
+    noobj_conf_loss =  torch.sum(((real_conf-pred_conf)**2)*(1-real_conf))*lambda_noobj
+    
+    
+    return (obj_conf_loss+noobj_conf_loss+classes_loss+xy_loss+wh_loss) 
+    
+    
 
-    #iou = iou_grid([pred_xy,pred_wh],[real_xy,real_wh])
-    iou = 1
-    
-    obj_conf_loss = torch.sum(((real_conf*iou-pred_conf)**2)*real_conf)
-    noobj_conf_loss =  torch.sum(((real_conf*iou-pred_conf)**2)*(1-real_conf))*lambda_noobj
-    
-    
-    #print(iou,conf_loss,classes_loss,xy_loss,wh_loss)
-    #print(f"obj_conf_loss : {obj_conf_loss} , noobj_conf_loss : {noobj_conf_loss} , class_loss : {classes_loss} , xy_loss : {xy_loss} , wh_loss : {wh_loss}")
-    return (obj_conf_loss+noobj_conf_loss+classes_loss+xy_loss+wh_loss)    
-    
-    
 def accuracy(true,preds,iou_thresh = 0.5, conf_thresh = 0.5 ):
     
     N,R,C = true.shape[:3]
     
-    t_classes = true[:,:,:,10:]
+    only_true = true[true[:,:,:,0]==1]
+    
+    t_classes = only_true[:,10:]
     p_classes = preds[:,:,:,10:]
     
-    t_boxes = true[:,:,:,:10].view((N,R,C,2,5))
+    t_boxes = only_true[:,:5]
     p_boxes = preds[:,:,:,:10].view((N,R,C,2,5))
-    
+        
     TP = 0
     FP = 0 
     TN = 0
     FN = 0
-    accuracy = 0
-    
+    GT = t_boxes.shape[0]
     
     for n in range(N):
         for r in range(R):
             for c in range(C):
-                tb = torch.argmax(t_boxes[n,r,c,:,0])
-                t_conf = t_boxes[n,r,c,tb,0]
-                t_box = t_boxes[n,r,c,tb,1:]
-                t_class = torch.argmax(t_classes[n,r,c])
-                
                 pb = torch.argmax(p_boxes[n,r,c,:,0])
-                p_conf = p_boxes[n,r,c,pb,0]
-                p_box = p_boxes[n,r,c,pb,1:]
                 p_class = torch.argmax(p_classes[n,r,c])
-
-                if t_conf == 0:
-                    if p_conf<conf_thresh:
-                        TN += 1
-                    else:
+                p_conf = p_boxes[n,r,c,pb,0]
+                p_coords = p_boxes[n,r,c,pb,1:]
+                    
+                for gt in range(GT):
+                    t_box = t_boxes[gt]
+                    t_class = torch.argmax(t_classes[gt])
+                    t_conf = t_box[0]
+                    t_coords = t_box[1:]
+                    
+                    iou = iou_ybb(p_coords,t_coords)
+                    
+                    if iou<iou_thresh:
                         FP += 1
-                else :
-                    iou = iou_ybb(p_box,t_box)
-                        
-                    if p_conf<conf_thresh:
-                        FN += 1
                     else:
-                        if iou<iou_thresh:
+                        if t_class != p_class:
                             FP += 1
                         else:
-                            if t_class != p_class:
-                                FP += 1
-                            else:
-                                TP += 1
-                                
-    accuracy = (TP+TN)/(TP+FP+TN+FN) 
+                            TP += 1
+                    
+                    
+                    
+                    
+                    
     
-    return accuracy,(TP,FP,TN,FN)
+#     for n in range(N):
+#         for r in range(R):
+#             for c in range(C):
+#                 tb = torch.argmax(t_boxes[n,r,c,:,0])
+#                 t_conf = t_boxes[n,r,c,tb,0]
+#                 t_box = t_boxes[n,r,c,tb,1:]
+#                 t_class = torch.argmax(t_classes[n,r,c])
+                
+#                 pb = torch.argmax(p_boxes[n,r,c,:,0])
+#                 p_conf = p_boxes[n,r,c,pb,0]
+#                 p_box = p_boxes[n,r,c,pb,1:]
+#                 p_class = torch.argmax(p_classes[n,r,c])
+                
+#                 if t_conf == 0:
+#                     if p_conf > conf_thresh:
+#                         FP += 1
+#                     else:
+#                         TN += 1
 
+#                 if t_conf == 1 :
+#                     GT += 1
+            
+#                     iou = iou_ybb(p_box,t_box)
+                    
+#                     if iou<iou_thresh:
+#                         FP += 1
+#                     else:
+#                         if t_class != p_class:
+#                             FP += 1
+#                         else:
+#                             TP += 1
+    FN = max(0,GT-TP)
+                
+    return (TP,FP,FN)
+                            
 
 
     
 def precision(metrics):
     
-    TP,FP,TN,FN = metrics 
+    TP,FP,FN = metrics 
     
     return TP/(TP+FP)
     
@@ -591,7 +633,7 @@ def precision(metrics):
 
 def recall(metrics):
     
-    TP,FP,TN,FN = metrics 
+    TP,FP,FN = metrics 
     
     return TP/(TP+FN)
 
@@ -617,10 +659,7 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
     
     loss_train_history = []
     loss_val_history = []
-    
-    accuracy_train_history = []
-    accuracy_val_history = []
-    
+        
     precision_train_history = []
     precision_val_history = []
 
@@ -637,9 +676,9 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
     for epoch in range(num_epochs):
         print('Epoch {}/{}'.format(epoch, num_epochs - 1))
         print('-' * 10)
+        epoch_loss = 0
         
         for phase in ['train', 'val']:
-        #for phase in ["val"]:
             if phase == 'train':
                 model.train()  # Set model to training mode
             else:
@@ -647,7 +686,6 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
 
             running_loss = 0.0
             running_loss_arr = []
-            running_acc = []
             running_prec = []
             running_rec = []
             running_f1 = []
@@ -675,35 +713,33 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
                 running_loss += loss.item()
                 print(f' Iteration Loss: {loss.item()}')
                 
-                if i%10 == 0:
+#                 if i%10 == 0:
                     
-                    acc , metrics =  accuracy(labels.float(),outputs.float())
-                    prec = precision(metrics)
-                    rec = recall(metrics)
-                    f1 = F1(prec,rec)
+#                     metrics =  accuracy(labels.float(),outputs.float())
+#                     prec = precision(metrics)
+#                     rec = recall(metrics)
+#                     f1 = F1(prec,rec)
                     
-                    running_loss_arr.append(loss.item())
-                    running_acc.append(acc)
-                    running_prec.append(prec)
-                    running_rec.append(rec)
-                    running_f1.append(f1)
+#                     running_loss_arr.append(loss.item())
+#                     running_prec.append(prec)
+#                     running_rec.append(rec)
+#                     running_f1.append(f1)
 
-                    print(f"{phase} Accuracy : {acc} , Precision : {prec} , Recall : {rec} , F1 : {f1} , metrics : {metrics}")
+#                     print(f"{phase} Precision : {prec} , Recall : {rec} , F1 : {f1} , metrics : {metrics}")
                              
-                    
+            print(f"{phase} prev epoch Loss: {epoch_loss}")
+        
             epoch_loss = running_loss / len(trainLoaders[phase])
 
-            print(f"{phase} epoch Loss: {epoch_loss}")
+            print(f"{phase} next epoch Loss: {epoch_loss}")
             
             if phase == "train":
                 loss_train_history.append(running_loss_arr)
-                accuracy_train_history.append(running_acc)
                 precision_train_history.append(running_prec)
                 recall_train_history.append(running_rec)
                 f1_train_history.append(running_f1)
             elif phase == "val":
                 loss_val_history.append(running_loss_arr)
-                accuracy_val_history.append(running_acc)
                 precision_val_history.append(running_prec)
                 recall_val_history.append(running_rec)
                 f1_val_history.append(running_f1)
@@ -726,8 +762,8 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
     # load best model weights
     model.load_state_dict(best_model_wts)
     
-    train_hist = [loss_train_history,accuracy_train_history,precision_train_history,recall_train_history,f1_train_history]
-    val_hist = [loss_val_history,accuracy_val_history,precision_val_history,recall_val_history,f1_val_history]
+    train_hist = [loss_train_history,precision_train_history,recall_train_history,f1_train_history]
+    val_hist = [loss_val_history,precision_val_history,recall_val_history,f1_val_history]
     
     return model,train_hist,val_hist 
     
@@ -741,11 +777,10 @@ def test_model(model, test_data, device = "cpu"):
 
     running_loss = 0.0
     running_loss_arr = []
-    running_acc = []
     running_prec = []
     running_rec = []
     running_f1 = []
-    metrics_arr = torch.zeros(4)
+    metrics_arr = torch.zeros(3)
 
     # Iterate over data.
     for i,data in enumerate(tqdm(test_data)):
@@ -756,7 +791,7 @@ def test_model(model, test_data, device = "cpu"):
         # forward
         outputs =  model(inputs/255).view(labels.shape)
         loss = yoloLoss(labels.float(),outputs.float(),5,0.5)
-        acc , metrics =  accuracy(labels.float(),outputs.float())
+        metrics =  accuracy(labels.float(),outputs.float())
         metrics_arr = metrics_arr+torch.tensor(metrics)
 
 
@@ -764,7 +799,7 @@ def test_model(model, test_data, device = "cpu"):
         running_loss += loss.item()
         print(f' Iteration Loss: {loss.item()}')
                 
-        if i%10 == 0:
+        if i%1 == 0:
                     
             
             prec = precision(metrics)
@@ -772,13 +807,12 @@ def test_model(model, test_data, device = "cpu"):
             f1 = F1(prec,rec)
                     
             running_loss_arr.append(loss.item())
-            running_acc.append(acc)
             running_prec.append(prec)
             running_rec.append(rec)
             running_f1.append(f1)
             
 
-            print(f"Accuracy : {acc} , Precision : {prec} , Recall : {rec} , F1 : {f1} , metrics : {metrics}")
+            print(f"Precision : {prec} , Recall : {rec} , F1 : {f1} , metrics : {metrics}")
                              
                     
     epoch_loss = running_loss / len(test_data)
@@ -792,7 +826,7 @@ def test_model(model, test_data, device = "cpu"):
     print('Training complete in {:.0f}m {:.0f}s'.format(
         time_elapsed // 60, time_elapsed % 60))
     
-    hist = [running_loss_arr,running_acc,running_prec,running_rec,running_f1,metrics_arr]
+    hist = [running_loss_arr,running_prec,running_rec,running_f1,metrics_arr]
     
     return hist
 

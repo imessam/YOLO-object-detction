@@ -6,6 +6,7 @@ import torch
 from torchvision import utils
 import datetime
 import copy
+from copy import deepcopy
 from tqdm import tqdm
 from time import sleep
 
@@ -334,21 +335,6 @@ def iou_bb(boxA, boxB):
     return iou
 
 
-def iou_nms(boxA,boxB):
-        
-    xy_A,wh_A = boxA[:,:2],boxA[:,2:]
-    xy_B,wh_B = boxB[:2],boxB[2:]
-    
-    intersect_wh = torch.maximum(torch.zeros_like(wh_A), (wh_A + wh_B)/2 - torch.abs(xy_A - xy_B) )
-    intersect_area = intersect_wh[:,0] * intersect_wh[:,1]
-    
-    true_area = wh_B[0] * wh_B[1]
-    pred_area = wh_A[:,0] * wh_A[:,1]
-    
-    union_area = pred_area + true_area - intersect_area+eps
-    iou = intersect_area / union_area
-    
-    return iou
 
 def iou_ybb(boxA,boxB):
         
@@ -365,6 +351,7 @@ def iou_ybb(boxA,boxB):
     iou = intersect_area / union_area
     
     return iou
+
 
 def iou_grid(gridA,gridB):
       
@@ -536,106 +523,169 @@ def yoloLoss(labels,predictions,lambda_coords,lambda_noobj):
     
     return (obj_conf_loss+noobj_conf_loss+classes_loss+xy_loss+wh_loss) 
     
-    
 
-def accuracy(true,preds,iou_thresh = 0.5, conf_thresh = 0.5 ):
+
+def toDict(names,boxes,isGroundTruth = False):
     
-    N,R,C = true.shape[:3]
+    N,R,C,D = boxes.shape    
+    boxes = boxes[:,:,:,:10].view((N,R*C,2,5)).reshape((N,R*C*2,5))
     
-    only_true = true[true[:,:,:,0]==1]
-    
-    t_classes = only_true[:,10:]
-    p_classes = preds[:,:,:,10:]
-    
-    t_boxes = only_true[:,:5]
-    p_boxes = preds[:,:,:,:10].view((N,R,C,2,5))
-        
-    TP = 0
-    FP = 0 
-    TN = 0
-    FN = 0
-    GT = t_boxes.shape[0]
+    dic = {}
     
     for n in range(N):
-        for r in range(R):
-            for c in range(C):
-                pb = torch.argmax(p_boxes[n,r,c,:,0])
-                p_class = torch.argmax(p_classes[n,r,c])
-                p_conf = p_boxes[n,r,c,pb,0]
-                p_coords = p_boxes[n,r,c,pb,1:]
-                    
-                for gt in range(GT):
-                    t_box = t_boxes[gt]
-                    t_class = torch.argmax(t_classes[gt])
-                    t_conf = t_box[0]
-                    t_coords = t_box[1:]
-                    
-                    iou = iou_ybb(p_coords,t_coords)
-                    
-                    if iou<iou_thresh:
-                        FP += 1
-                    else:
-                        if t_class != p_class:
-                            FP += 1
-                        else:
-                            TP += 1
-                    
-                    
-                    
-                    
-                    
+        for i in range(R*C*2):
+            if names[n] not in dic:
+                dic[names[n]] = {"bbox":[],"scores":[]}
+            if (isGroundTruth and boxes[n,i,0] == 1) or not isGroundTruth:
+                dic[names[n]]["scores"].append(boxes[n,i,0].tolist())
+                dic[names[n]]["bbox"].append(boxes[n,i,1:].tolist())
+    return dic
     
-#     for n in range(N):
-#         for r in range(R):
-#             for c in range(C):
-#                 tb = torch.argmax(t_boxes[n,r,c,:,0])
-#                 t_conf = t_boxes[n,r,c,tb,0]
-#                 t_box = t_boxes[n,r,c,tb,1:]
-#                 t_class = torch.argmax(t_classes[n,r,c])
-                
-#                 pb = torch.argmax(p_boxes[n,r,c,:,0])
-#                 p_conf = p_boxes[n,r,c,pb,0]
-#                 p_box = p_boxes[n,r,c,pb,1:]
-#                 p_class = torch.argmax(p_classes[n,r,c])
-                
-#                 if t_conf == 0:
-#                     if p_conf > conf_thresh:
-#                         FP += 1
-#                     else:
-#                         TN += 1
-
-#                 if t_conf == 1 :
-#                     GT += 1
+        
             
-#                     iou = iou_ybb(p_box,t_box)
-                    
-#                     if iou<iou_thresh:
-#                         FP += 1
-#                     else:
-#                         if t_class != p_class:
-#                             FP += 1
-#                         else:
-#                             TP += 1
-    FN = max(0,GT-TP)
-                
-    return (TP,FP,FN)
-                            
+    
+def get_model_scores(pred_boxes):
+    """Creates a dictionary of from model_scores to image ids.
+    Args:
+        pred_boxes
+    Returns:
+        dict: keys are model_scores and values are image ids (usually filenames)
+    """
+    
+    model_score={}
+    for name in pred_boxes.keys():
+        for score in pred_boxes[name]["scores"]:
+            if score not in model_score.keys():
+                model_score[score]=[name]
+            else:
+                model_score[score].append(name)
+    return model_score 
 
+
+    
+    
+    
+def get_single_image_results(gt_boxes, pred_boxes, iou_thr):
+    """Calculates number of true_pos, false_pos, false_neg from single batch of boxes.
+    Args:
+        gt_boxes 
+        pred_boxes 
+        iou_thr (float): value of IoU to consider as threshold for a
+            true prediction.
+    Returns:
+        dict: true positives (int), false positives (int), false negatives (int)
+    """
+    real_bbox = torch.tensor(gt_boxes)
+    pred_bbox = torch.tensor(pred_boxes)
+    
+    all_pred_indices = range(len(pred_bbox))
+    all_gt_indices = range(len(real_bbox))
+        
+    if len(all_pred_indices)==0:
+        tp=0
+        fp=0
+        fn=0
+        return {'true_positive':tp, 'false_positive':fp, 'false_negative':fn}
+    if len(all_gt_indices)==0:
+        tp=0
+        fp=0
+        fn=0
+        return {'true_positive':tp, 'false_positive':fp, 'false_negative':fn}
+    
+    gt_idx_thr=[]
+    pred_idx_thr=[]
+    ious=[]
+    for ipb, pred_box in enumerate(pred_bbox):
+        for igb, gt_box in enumerate(real_bbox):
+            iou= iou_ybb(pred_box, gt_box)
+            
+            if iou >iou_thr:
+                gt_idx_thr.append(igb)
+                pred_idx_thr.append(ipb)
+                ious.append(iou)
+    iou_sort = np.argsort(ious)[::1]
+    if len(iou_sort)==0:
+        tp=0
+        fp=0
+        fn=0
+        return {'true_positive':tp, 'false_positive':fp, 'false_negative':fn}
+    else:
+        gt_match_idx=[]
+        pred_match_idx=[]
+        for idx in iou_sort:
+            gt_idx=gt_idx_thr[idx]
+            pr_idx= pred_idx_thr[idx]
+            # If the boxes are unmatched, add them to matches
+            if(gt_idx not in gt_match_idx) and (pr_idx not in pred_match_idx):
+                gt_match_idx.append(gt_idx)
+                pred_match_idx.append(pr_idx)
+        tp = len(gt_match_idx)
+        fp = len(pred_bbox) - len(pred_match_idx)
+        fn = len(real_bbox) - len(gt_match_idx)
+    return {'true_positive': tp, 'false_positive': fp, 'false_negative': fn}    
+
+
+
+def accuracy(true,preds,iou_thresh = 0.5):
+
+    names = true.keys()
+    
+    TP = 0
+    FP = 0
+    FN = 0
+    
+    
+    for name in names:
+        
+        true_bbox = true[name]["bbox"]
+        pred_bbox = preds[name]["bbox"]
+        
+        res = get_single_image_results(true_bbox,pred_bbox,iou_thresh)
+        
+        TP+=res["true_positive"]
+        FP+=res["false_positive"]
+        FN+=res["false_negative"]
+    
+    return {"TP":TP,"FP":FP,"FN":FN}                    
+
+
+def calc_precision_recall(results):
+    
+    TP = 0
+    FP = 0
+    FN = 0
+    
+    for ids in results.keys():
+        
+        res = results[ids]
+        
+        TP+=res["true_positive"]
+        FP+=res["false_positive"]
+        FN+=res["false_negative"]
+    
+    metrics = {"TP":TP,"FP":FP,"FN":FN} 
+    
+    prec = precision(metrics)
+    rec = recall(metrics)
+    
+    return metrics,prec,rec
+    
+        
 
     
 def precision(metrics):
     
-    TP,FP,FN = metrics 
+    TP,FP,FN = metrics["TP"],metrics["FP"],metrics["FN"]  
     
-    return TP/(TP+FP)
+    return TP/(TP+FP+eps)
     
 
 
 def recall(metrics):
     
-    TP,FP,FN = metrics 
+    TP,FP,FN = metrics["TP"],metrics["FP"],metrics["FN"]   
     
-    return TP/(TP+FN)
+    return TP/(TP+FN+eps)
 
 
 def F1(precision,recall):
@@ -643,9 +693,73 @@ def F1(precision,recall):
     return 2*((precision*recall)/(precision + recall+eps))
 
 
-def AP(precision,recall):
+def AP(gt_boxes, pred_boxes, iou_thr=0.5):
     
-    pass
+    model_scores = get_model_scores(pred_boxes)
+    sorted_model_scores= sorted(model_scores.keys())
+    
+    names = gt_boxes.keys()
+    
+    # Sort the predicted boxes in descending order (lowest scoring boxes first):
+    for name in names:
+        
+        arg_sort = np.argsort(pred_boxes[name]["scores"])
+        pred_boxes[name]["scores"] = np.array(pred_boxes[name]["scores"])[arg_sort].tolist()
+        pred_boxes[name]["bbox"] = np.array(pred_boxes[name]["bbox"])[arg_sort].tolist()
+
+    pred_boxes_pruned = deepcopy(pred_boxes)
+    precisions = []
+    recalls = []
+    model_thrs = []
+    img_results = {}
+    
+    # Loop over model score thresholds and calculate precision, recall
+    for ithr, model_score_thr in enumerate(sorted_model_scores[:-1]):
+        
+        # On first iteration, define img_results for the first time:
+        img_ids = names if ithr == 0 else model_scores[model_score_thr]
+        for name in img_ids:
+               
+            gt_boxes_img = gt_boxes[name]["bbox"]
+            box_scores = pred_boxes[name]["scores"]
+            start_idx = 0
+            for score in box_scores:
+                if score <= model_score_thr:
+                    start_idx += 1
+                else:
+                    break 
+                    
+            #Remove boxes, scores of lower than threshold scores:
+            pred_boxes_pruned[name]["bbox"]= pred_boxes_pruned[name]["bbox"][start_idx:]
+            
+            # Recalculate image results for this image
+            img_results[name] = get_single_image_results(gt_boxes_img, pred_boxes_pruned[name]["bbox"], iou_thr=0.5)
+            
+        # calculate precision and recall
+        metrics ,prec, rec = calc_precision_recall(img_results)
+        precisions.append(prec)
+        recalls.append(rec)
+        model_thrs.append(model_score_thr)
+        
+        
+        
+    precisions = np.array(precisions)
+    recalls = np.array(recalls)
+    prec_at_rec = []
+    for recall_level in np.linspace(0.0, 1.0, 11):
+        try:
+            args= np.argwhere(recalls>recall_level).flatten()
+            prec= max(precisions[args])
+        except ValueError:
+            prec=0.0
+        prec_at_rec.append(prec)
+    avg_prec = np.mean(prec_at_rec) 
+    return {
+        'ap': avg_prec,
+        'precisions': precisions,
+        'recalls': recalls,
+        'thresh': model_thrs}
+
 
 
 def mAP(true,preds,thresh):
@@ -659,15 +773,6 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
     
     loss_train_history = []
     loss_val_history = []
-        
-    precision_train_history = []
-    precision_val_history = []
-
-    recall_train_history = []
-    recall_val_history = []
-    
-    f1_train_history = []
-    f1_val_history = []
 
     best_model_wts = copy.deepcopy(model.state_dict())
     best_loss = float('inf')    
@@ -685,10 +790,6 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
                 model.eval()   # Set model to evaluate mode
 
             running_loss = 0.0
-            running_loss_arr = []
-            running_prec = []
-            running_rec = []
-            running_f1 = []
 
             # Iterate over data.
             for i,data in enumerate(tqdm(trainLoaders[phase])):
@@ -713,19 +814,6 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
                 running_loss += loss.item()
                 print(f' Iteration Loss: {loss.item()}')
                 
-#                 if i%10 == 0:
-                    
-#                     metrics =  accuracy(labels.float(),outputs.float())
-#                     prec = precision(metrics)
-#                     rec = recall(metrics)
-#                     f1 = F1(prec,rec)
-                    
-#                     running_loss_arr.append(loss.item())
-#                     running_prec.append(prec)
-#                     running_rec.append(rec)
-#                     running_f1.append(f1)
-
-#                     print(f"{phase} Precision : {prec} , Recall : {rec} , F1 : {f1} , metrics : {metrics}")
                              
             print(f"{phase} prev epoch Loss: {epoch_loss}")
         
@@ -733,16 +821,7 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
 
             print(f"{phase} next epoch Loss: {epoch_loss}")
             
-            if phase == "train":
-                loss_train_history.append(running_loss_arr)
-                precision_train_history.append(running_prec)
-                recall_train_history.append(running_rec)
-                f1_train_history.append(running_f1)
-            elif phase == "val":
-                loss_val_history.append(running_loss_arr)
-                precision_val_history.append(running_prec)
-                recall_val_history.append(running_rec)
-                f1_val_history.append(running_f1)
+            if phase == "val":
                 
                 # deep copy the model
                 if epoch_loss<best_loss:
@@ -761,11 +840,8 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
 
     # load best model weights
     model.load_state_dict(best_model_wts)
-    
-    train_hist = [loss_train_history,precision_train_history,recall_train_history,f1_train_history]
-    val_hist = [loss_val_history,precision_val_history,recall_val_history,f1_val_history]
-    
-    return model,train_hist,val_hist 
+      
+    return model
     
 
     
@@ -776,48 +852,34 @@ def test_model(model, test_data, device = "cpu"):
     model.eval()   # Set model to evaluate mode
 
     running_loss = 0.0
-    running_loss_arr = []
-    running_prec = []
-    running_rec = []
-    running_f1 = []
-    metrics_arr = torch.zeros(3)
-
+    aps = 0.0
+    
     # Iterate over data.
     for i,data in enumerate(tqdm(test_data)):
-
+        
+        names = data["name"]
         inputs = data["image"].to(device)
         labels = data["annotation"].to(device)
 
         # forward
         outputs =  model(inputs/255).view(labels.shape)
         loss = yoloLoss(labels.float(),outputs.float(),5,0.5)
-        metrics =  accuracy(labels.float(),outputs.float())
-        metrics_arr = metrics_arr+torch.tensor(metrics)
-
-
+        
+        t_dict = toDict(names,labels,True)
+        p_dict = toDict(names,outputs)
+        
+        ap = AP(t_dict,p_dict)["ap"]
+        
         # statistics
         running_loss += loss.item()
-        print(f' Iteration Loss: {loss.item()}')
-                
-        if i%1 == 0:
-                    
-            
-            prec = precision(metrics)
-            rec = recall(metrics)
-            f1 = F1(prec,rec)
-                    
-            running_loss_arr.append(loss.item())
-            running_prec.append(prec)
-            running_rec.append(rec)
-            running_f1.append(f1)
-            
-
-            print(f"Precision : {prec} , Recall : {rec} , F1 : {f1} , metrics : {metrics}")
+        aps += ap
+        print(f' Iteration Loss: {loss.item()} , Average Precision : {ap}')
                              
                     
     epoch_loss = running_loss / len(test_data)
+    ap = aps / len(test_data)
 
-    print(f" Final Loss: {epoch_loss}")
+    print(f" Final Loss: {epoch_loss} , Final Average Precision : {ap}")
           
 
     print()
@@ -825,10 +887,8 @@ def test_model(model, test_data, device = "cpu"):
     time_elapsed = (datetime.datetime.now() - since).total_seconds()
     print('Training complete in {:.0f}m {:.0f}s'.format(
         time_elapsed // 60, time_elapsed % 60))
-    
-    hist = [running_loss_arr,running_prec,running_rec,running_f1,metrics_arr]
-    
-    return hist
+        
+    return epoch_loss,ap
 
     
     

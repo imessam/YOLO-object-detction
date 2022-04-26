@@ -30,7 +30,7 @@ class VOCDataset(Dataset):
         img_name = self.images_dirs[idx]
         image = plt.imread(img_name)
         annotaion = self.annotations[idx]
-        sample = {'image': image, 'annotation': annotaion}
+        sample = {'name':img_name,'image': image, 'annotation': annotaion}
 
         if self.transform:
             sample = self.transform(sample)
@@ -54,7 +54,7 @@ class Rescale(object):
         self.output_size = output_size
 
     def __call__(self, sample):
-        image, annotations = sample['image'], sample['annotation']
+        name, image, annotations = sample['name'], sample['image'], sample['annotation']
 
         h, w = image.shape[:2]
         if isinstance(self.output_size, int):
@@ -70,18 +70,20 @@ class Rescale(object):
         img = cv2.resize(image, (new_h, new_w))
 
 
-        return {'image': img, 'annotation': annotations}
+        return {'name':name,'image': img, 'annotation': annotations}
     
 class ToTensor(object):
     """Convert ndarrays in sample to Tensors."""
 
     def __call__(self, sample):
-        image, annotations = sample['image'], sample['annotation']
+        name, image, annotations = sample['name'], sample['image'], sample['annotation']
 
         # swap color axis because
         # numpy image: H x W x C
         # torch image: C x H x W
         image = image.transpose((2, 0, 1))
-        return {'image': torch.from_numpy(image),
+        return {'name':name,
+                'image': torch.from_numpy(image),
                 'annotation': torch.from_numpy(annotations)}
+    
     

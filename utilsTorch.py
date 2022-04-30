@@ -24,6 +24,15 @@ no_classes = 20
 no_boxes = 2
 
 
+
+def toTensor(image):
+    
+    image = image.transpose((2, 0, 1))
+    
+    return torch.from_numpy(image)
+
+
+
 def resizeImage(image, newSize):
     
     '''
@@ -40,6 +49,18 @@ def resizeImage(image, newSize):
     new_image = cv2.resize(image, newSize)
 
     return new_image
+
+
+
+
+def preProcessImage(image,newSize):
+    
+    resizedImage = resizeImage(image,newSize)
+    
+    return toTensor(resizedImage)
+
+
+
 
 
 def showImage(image):
@@ -280,6 +301,7 @@ def localizeObjects(image, objects,aspectRatios=(1,1)):
         
         label = obj["name"]
         bbox = obj["bndbox"]
+        conf = str(round(obj["conf"]*100,2))+"%"
         if not isinstance(bbox, dict):
             ymin, xmin, ymax, xmax = [int(b) for b in bbox]
         else:
@@ -291,14 +313,18 @@ def localizeObjects(image, objects,aspectRatios=(1,1)):
         color = (255, 0, 0)
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        org = (xmin, ymin)
-        fontScale = 1
+        orgLabel = (xmin, ymin)
+        orgConf = (xmax,ymin)
+        fontScale = 0.5
         textColor = (255, 0, 255)
-        thickness = 2
-        image_T = cv2.putText(image_R, label, org, font,
+        thickness = 1
+        
+        image_T = cv2.putText(image_R, label, orgLabel, font,
+                              fontScale, textColor, thickness, cv2.LINE_AA)
+        image_E = cv2.putText(image_T, conf, orgConf, font,
                               fontScale, textColor, thickness, cv2.LINE_AA)
 
-        image_R = cv2.rectangle(image_T, start_point, end_point, color, thickness)
+        image_R = cv2.rectangle(image_E, start_point, end_point, color, thickness)
 
     return image_R
 
@@ -370,6 +396,41 @@ def iou_grid(gridA,gridB):
     return iou
 
 
+def bbox_iou(box1, box2, x1y1x2y2=True):
+    """
+    Returns the IoU of two bounding boxes
+    """
+    if not x1y1x2y2:
+        # Transform from center and width to exact coordinates
+        b1_x1, b1_x2 = box1[:, 0] - box1[:, 2] / 2, box1[:, 0] + box1[:, 2] / 2
+        b1_y1, b1_y2 = box1[:, 1] - box1[:, 3] / 2, box1[:, 1] + box1[:, 3] / 2
+        b2_x1, b2_x2 = box2[:, 0] - box2[:, 2] / 2, box2[:, 0] + box2[:, 2] / 2
+        b2_y1, b2_y2 = box2[:, 1] - box2[:, 3] / 2, box2[:, 1] + box2[:, 3] / 2
+    else:
+        # Get the coordinates of bounding boxes
+        b1_x1, b1_y1, b1_x2, b1_y2 = \
+            box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
+        b2_x1, b2_y1, b2_x2, b2_y2 = \
+            box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
+
+    # get the corrdinates of the intersection rectangle
+    inter_rect_x1 = torch.max(b1_x1, b2_x1)
+    inter_rect_y1 = torch.max(b1_y1, b2_y1)
+    inter_rect_x2 = torch.min(b1_x2, b2_x2)
+    inter_rect_y2 = torch.min(b1_y2, b2_y2)
+    # Intersection area
+    inter_area = torch.clamp(inter_rect_x2 - inter_rect_x1 + 1, min=0) * torch.clamp(
+        inter_rect_y2 - inter_rect_y1 + 1, min=0
+    )
+    # Union Area
+    b1_area = (b1_x2 - b1_x1 + 1) * (b1_y2 - b1_y1 + 1)
+    b2_area = (b2_x2 - b2_x1 + 1) * (b2_y2 - b2_y1 + 1)
+
+    iou = inter_area / (b1_area + b2_area - inter_area + 1e-16)
+
+    return iou
+
+
 
 
 
@@ -435,20 +496,24 @@ def localizeAnnotations(image,annotations,thresh=0.5):
             box1 = [*annotations[r,c,:5]]
             box2 = [*annotations[r,c,5:10]]
             
+            conf = box1[0]
             box = yolo2box(unnormalizeYOLO([*box1[1:5]],w,h),w,h)
             if box1[0] >= thresh:
                 obj = {}
                 obj["bndbox"] = box
                 obj["name"] = idx2label[np.argmax(annotations[r,c,10:])]
+                obj["conf"] = conf
                 image = localizeObjects(image,[obj])
             else:
                 pass
                 #image = localizeBoxes(image,[box])
+            conf = box2[0]
             box = yolo2box(unnormalizeYOLO([*box2[1:5]],w,h),w,h)
             if box2[0] >= thresh:
                 obj = {}
                 obj["bndbox"] = box
                 obj["name"] = idx2label[np.argmax(annotations[r,c,10:])]
+                obj["conf"] = conf
                 image = localizeObjects(image,[obj])
             else:
                 pass
@@ -458,14 +523,17 @@ def localizeAnnotations(image,annotations,thresh=0.5):
 
 
 
-def showSample(sample,thresh=0.5):
+def showSample(sample,thresh=0.5,isShow = True):
     
     image = sample["image"].numpy().transpose((1,2,0))
     annotations = sample["annotation"].numpy()
     
     image = localizeAnnotations(image,annotations,thresh)
     
-    showImage(image)
+    if isShow:
+        showImage(image)
+    
+    return image 
 
 
     
@@ -525,242 +593,79 @@ def yoloLoss(labels,predictions,lambda_coords,lambda_noobj):
     
 
 
-def toDict(names,boxes,isGroundTruth = False):
+def toDict(names,boxes,isGroundTruth = False,defaultDict = None):
     
     N,R,C,D = boxes.shape    
-    boxes = boxes[:,:,:,:10].view((N,R*C,2,5)).reshape((N,R*C*2,5))
+    bbox = boxes[:,:,:,:10].view((N,R*C,2,5)).reshape((N,R*C*2,5))
+    classes = boxes[:,:,:,10:].view((N,R*C,20)).reshape((N,R*C,20))
     
     dic = {}
+    if defaultDict is not None:
+        dic = defaultDict
+    
     
     for n in range(N):
         for i in range(R*C*2):
             if names[n] not in dic:
-                dic[names[n]] = {"bbox":[],"scores":[]}
-            if (isGroundTruth and boxes[n,i,0] == 1) or not isGroundTruth:
-                dic[names[n]]["scores"].append(boxes[n,i,0].tolist())
-                dic[names[n]]["bbox"].append(boxes[n,i,1:].tolist())
+                dic[names[n]] = {"bbox":[],"scores":[],"classes":[]}
+            if (isGroundTruth and bbox[n,i,0] == 1) or not isGroundTruth:
+                dic[names[n]]["scores"].append(bbox[n,i,0].tolist())
+                dic[names[n]]["bbox"].append(bbox[n,i,1:].tolist())
+                dic[names[n]]["classes"].append(np.argmax(classes[n,i//2]))
     return dic
     
-        
-            
-    
-def get_model_scores(pred_boxes):
-    """Creates a dictionary of from model_scores to image ids.
-    Args:
-        pred_boxes
-    Returns:
-        dict: keys are model_scores and values are image ids (usually filenames)
-    """
-    
-    model_score={}
-    for name in pred_boxes.keys():
-        for score in pred_boxes[name]["scores"]:
-            if score not in model_score.keys():
-                model_score[score]=[name]
-            else:
-                model_score[score].append(name)
-    return model_score 
-
 
     
-    
-    
-def get_single_image_results(gt_boxes, pred_boxes, iou_thr):
-    """Calculates number of true_pos, false_pos, false_neg from single batch of boxes.
-    Args:
-        gt_boxes 
-        pred_boxes 
-        iou_thr (float): value of IoU to consider as threshold for a
-            true prediction.
-    Returns:
-        dict: true positives (int), false positives (int), false negatives (int)
-    """
-    real_bbox = torch.tensor(gt_boxes)
-    pred_bbox = torch.tensor(pred_boxes)
-    
-    all_pred_indices = range(len(pred_bbox))
-    all_gt_indices = range(len(real_bbox))
-        
-    if len(all_pred_indices)==0:
-        tp=0
-        fp=0
-        fn=0
-        return {'true_positive':tp, 'false_positive':fp, 'false_negative':fn}
-    if len(all_gt_indices)==0:
-        tp=0
-        fp=0
-        fn=0
-        return {'true_positive':tp, 'false_positive':fp, 'false_negative':fn}
-    
-    gt_idx_thr=[]
-    pred_idx_thr=[]
-    ious=[]
-    for ipb, pred_box in enumerate(pred_bbox):
-        for igb, gt_box in enumerate(real_bbox):
-            iou= iou_ybb(pred_box, gt_box)
-            
-            if iou >iou_thr:
-                gt_idx_thr.append(igb)
-                pred_idx_thr.append(ipb)
-                ious.append(iou)
-    iou_sort = np.argsort(ious)[::1]
-    if len(iou_sort)==0:
-        tp=0
-        fp=0
-        fn=0
-        return {'true_positive':tp, 'false_positive':fp, 'false_negative':fn}
-    else:
-        gt_match_idx=[]
-        pred_match_idx=[]
-        for idx in iou_sort:
-            gt_idx=gt_idx_thr[idx]
-            pr_idx= pred_idx_thr[idx]
-            # If the boxes are unmatched, add them to matches
-            if(gt_idx not in gt_match_idx) and (pr_idx not in pred_match_idx):
-                gt_match_idx.append(gt_idx)
-                pred_match_idx.append(pr_idx)
-        tp = len(gt_match_idx)
-        fp = len(pred_bbox) - len(pred_match_idx)
-        fn = len(real_bbox) - len(gt_match_idx)
-    return {'true_positive': tp, 'false_positive': fp, 'false_negative': fn}    
-
-
-
-def accuracy(true,preds,iou_thresh = 0.5):
-
-    names = true.keys()
-    
-    TP = 0
-    FP = 0
-    FN = 0
-    
-    
+def get_batch_statistics(outputs, targets, iou_threshold):
+    """ Compute true positives, predicted scores and predicted labels per sample """
+    batch_metrics = []
+    names = targets.keys()
     for name in names:
-        
-        true_bbox = true[name]["bbox"]
-        pred_bbox = preds[name]["bbox"]
-        
-        res = get_single_image_results(true_bbox,pred_bbox,iou_thresh)
-        
-        TP+=res["true_positive"]
-        FP+=res["false_positive"]
-        FN+=res["false_negative"]
-    
-    return {"TP":TP,"FP":FP,"FN":FN}                    
 
+        if outputs[name] is None:
+            continue
 
-def calc_precision_recall(results):
-    
-    TP = 0
-    FP = 0
-    FN = 0
-    
-    for ids in results.keys():
-        
-        res = results[ids]
-        
-        TP+=res["true_positive"]
-        FP+=res["false_positive"]
-        FN+=res["false_negative"]
-    
-    metrics = {"TP":TP,"FP":FP,"FN":FN} 
-    
-    prec = precision(metrics)
-    rec = recall(metrics)
-    
-    return metrics,prec,rec
-    
-        
+        output = outputs[name]
+        pred_boxes = output["bbox"]
+        pred_scores = output["scores"]
+        pred_labels = output["classes"]
 
-    
-def precision(metrics):
-    
-    TP,FP,FN = metrics["TP"],metrics["FP"],metrics["FN"]  
-    
-    return TP/(TP+FP+eps)
-    
+        true_positives = np.zeros(len(pred_boxes))
 
+        annotations = targets[name]
+        target_labels = annotations["classes"]
+        if len(annotations):
+            detected_boxes = []
+            target_boxes = annotations["bbox"]
 
-def recall(metrics):
+            for pred_i, (pred_box, pred_label) in enumerate(zip(pred_boxes, pred_labels)):
+
+                # If targets are found break
+                if len(detected_boxes) == len(annotations):
+                    break
+
+                # Ignore if label is not one of the target labels
+                if pred_label not in target_labels:
+                    continue
+
+                # Filter target_boxes by pred_label so that we only match against boxes of our own label
+                filtered_target_position, filtered_targets = zip(*filter(lambda x: target_labels[x[0]] == pred_label, enumerate(target_boxes)))
+                # Find the best matching target for our predicted box
+                iou, box_filtered_index = bbox_iou(torch.tensor(pred_box).unsqueeze(0), 
+                                                   torch.tensor(filtered_targets),False).max(0)
+
+                # Remap the index in the list of filtered targets for that label to the index in the list with all targets.
+                box_index = filtered_target_position[box_filtered_index]
+
+                # Check if the iou is above the min treshold and i
+                if iou >= iou_threshold and box_index not in detected_boxes:
+                    true_positives[pred_i] = 1
+                    detected_boxes += [box_index]
+        batch_metrics.append([np.array(true_positives), np.array(pred_scores), np.array(pred_labels), np.array(target_labels)])
+    return batch_metrics    
     
-    TP,FP,FN = metrics["TP"],metrics["FP"],metrics["FN"]   
     
-    return TP/(TP+FN+eps)
-
-
-def F1(precision,recall):
     
-    return 2*((precision*recall)/(precision + recall+eps))
-
-
-def AP(gt_boxes, pred_boxes, iou_thr=0.5):
-    
-    model_scores = get_model_scores(pred_boxes)
-    sorted_model_scores= sorted(model_scores.keys())
-    
-    names = gt_boxes.keys()
-    
-    # Sort the predicted boxes in descending order (lowest scoring boxes first):
-    for name in names:
-        
-        arg_sort = np.argsort(pred_boxes[name]["scores"])
-        pred_boxes[name]["scores"] = np.array(pred_boxes[name]["scores"])[arg_sort].tolist()
-        pred_boxes[name]["bbox"] = np.array(pred_boxes[name]["bbox"])[arg_sort].tolist()
-
-    pred_boxes_pruned = deepcopy(pred_boxes)
-    precisions = []
-    recalls = []
-    model_thrs = []
-    img_results = {}
-    
-    # Loop over model score thresholds and calculate precision, recall
-    for ithr, model_score_thr in enumerate(sorted_model_scores[:-1]):
-        
-        # On first iteration, define img_results for the first time:
-        img_ids = names if ithr == 0 else model_scores[model_score_thr]
-        for name in img_ids:
-               
-            gt_boxes_img = gt_boxes[name]["bbox"]
-            box_scores = pred_boxes[name]["scores"]
-            start_idx = 0
-            for score in box_scores:
-                if score <= model_score_thr:
-                    start_idx += 1
-                else:
-                    break 
-                    
-            #Remove boxes, scores of lower than threshold scores:
-            pred_boxes_pruned[name]["bbox"]= pred_boxes_pruned[name]["bbox"][start_idx:]
-            
-            # Recalculate image results for this image
-            img_results[name] = get_single_image_results(gt_boxes_img, pred_boxes_pruned[name]["bbox"], iou_thr=0.5)
-            
-        # calculate precision and recall
-        metrics ,prec, rec = calc_precision_recall(img_results)
-        precisions.append(prec)
-        recalls.append(rec)
-        model_thrs.append(model_score_thr)
-        
-        
-        
-    precisions = np.array(precisions)
-    recalls = np.array(recalls)
-    prec_at_rec = []
-    for recall_level in np.linspace(0.0, 1.0, 11):
-        try:
-            args= np.argwhere(recalls>recall_level).flatten()
-            prec= max(precisions[args])
-        except ValueError:
-            prec=0.0
-        prec_at_rec.append(prec)
-    avg_prec = np.mean(prec_at_rec) 
-    return {
-        'ap': avg_prec,
-        'precisions': precisions,
-        'recalls': recalls,
-        'thresh': model_thrs}
-
-
 
 def mAP(true,preds,thresh):
     
@@ -852,7 +757,10 @@ def test_model(model, test_data, device = "cpu"):
     model.eval()   # Set model to evaluate mode
 
     running_loss = 0.0
+    ap = 0.0
     aps = 0.0
+    t_dict = {}
+    p_dict = {}
     
     # Iterate over data.
     for i,data in enumerate(tqdm(test_data)):
@@ -865,19 +773,19 @@ def test_model(model, test_data, device = "cpu"):
         outputs =  model(inputs/255).view(labels.shape)
         loss = yoloLoss(labels.float(),outputs.float(),5,0.5)
         
-        t_dict = toDict(names,labels,True)
-        p_dict = toDict(names,outputs)
+        t_dict = toDict(names,labels,True,t_dict)
+        p_dict = toDict(names,outputs,False,p_dict)
         
-        ap = AP(t_dict,p_dict)["ap"]
+        #ap = AP(t_dict,p_dict)["ap"]
         
         # statistics
         running_loss += loss.item()
-        aps += ap
-        print(f' Iteration Loss: {loss.item()} , Average Precision : {ap}')
+        #aps += ap
+        print(f' Iteration Loss: {loss.item()}')
                              
                     
     epoch_loss = running_loss / len(test_data)
-    ap = aps / len(test_data)
+    #ap = aps / len(test_data)
 
     print(f" Final Loss: {epoch_loss} , Final Average Precision : {ap}")
           
@@ -888,7 +796,7 @@ def test_model(model, test_data, device = "cpu"):
     print('Training complete in {:.0f}m {:.0f}s'.format(
         time_elapsed // 60, time_elapsed % 60))
         
-    return epoch_loss,ap
+    return epoch_loss,(t_dict,p_dict)
 
     
     

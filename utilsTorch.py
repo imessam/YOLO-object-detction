@@ -615,8 +615,33 @@ def toDict(names,boxes,isGroundTruth = False,defaultDict = None):
     return dic
     
 
+def get_model_scores(pred_boxes):
+    """Creates a dictionary of from model_scores to image ids.
+    Args:
+        pred_boxes
+    Returns:
+        dict: keys are model_scores and values are image ids (usually filenames)
+    """
     
-def get_batch_statistics(outputs, targets, iou_threshold):
+    model_score={}
+    for name in pred_boxes.keys():
+        for i,score in enumerate(pred_boxes[name]["scores"]):
+            if score not in model_score.keys():
+                model_score[score] = {"name":[name],
+                                      "bbox":[pred_boxes[name]["bbox"][i]],
+                                      "classes":[pred_boxes[name]["classes"][i]],
+                                      "tp":[pred_boxes[name]["tp"][i]]}
+            else:
+                model_score[score]["name"].append(name)
+                model_score[score]["bbox"].append(pred_boxes[name]["bbox"][i])
+                model_score[score]["classes"].append(pred_boxes[name]["classes"][i])
+                model_score[score]["tp"].append(pred_boxes[name]["tp"][i])
+                
+    return model_score 
+
+
+    
+def get_batch_statistics(outputs, targets, iou_threshold = 0.5):
     """ Compute true positives, predicted scores and predicted labels per sample """
     batch_metrics = []
     names = targets.keys()
@@ -629,8 +654,15 @@ def get_batch_statistics(outputs, targets, iou_threshold):
         pred_boxes = output["bbox"]
         pred_scores = output["scores"]
         pred_labels = output["classes"]
+        
+        sorted_indices = np.argsort(pred_scores)[::-1]
+        
+        pred_scores_sorted = np.array(pred_scores)[sorted_indices].tolist()
+        pred_boxes_sorted = np.array(pred_boxes)[sorted_indices].tolist()
+        pred_labels_sorted = np.array(pred_labels)[sorted_indices].tolist()
+        
 
-        true_positives = np.zeros(len(pred_boxes))
+        true_positives = np.zeros(len(pred_boxes_sorted))
 
         annotations = targets[name]
         target_labels = annotations["classes"]
@@ -638,7 +670,7 @@ def get_batch_statistics(outputs, targets, iou_threshold):
             detected_boxes = []
             target_boxes = annotations["bbox"]
 
-            for pred_i, (pred_box, pred_label) in enumerate(zip(pred_boxes, pred_labels)):
+            for pred_i, (pred_box, pred_label) in enumerate(zip(pred_boxes_sorted, pred_labels_sorted)):
 
                 # If targets are found break
                 if len(detected_boxes) == len(annotations):
@@ -661,17 +693,117 @@ def get_batch_statistics(outputs, targets, iou_threshold):
                 if iou >= iou_threshold and box_index not in detected_boxes:
                     true_positives[pred_i] = 1
                     detected_boxes += [box_index]
-        batch_metrics.append([np.array(true_positives), np.array(pred_scores), np.array(pred_labels), np.array(target_labels)])
-    return batch_metrics    
-    
-    
+                    
+                outputs[name]["bbox"] = pred_boxes_sorted
+                outputs[name]["scores"] = pred_scores_sorted
+                outputs[name]["classes"] = pred_labels_sorted
+                outputs[name]["tp"] = true_positives
+                
+    return outputs  
+
+
+def ap(true,preds):
+    """ Compute the average precision, given the recall and precision curves.
+    Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
+    # Arguments
+        tp:    True positives (list).
+        conf:  Objectness value from 0-1 (list).
+        pred_cls: Predicted object classes (list).
+        target_cls: True object classes (list).
+    # Returns
+        The average precision as computed in py-faster-rcnn.
+    """
+        
+    ap, p, r = [], [], []
+    fpc = 0
+    tpc = 0
+    n_gt = 0
+    n_p = 0
+        
+    for name in true.keys():
+        n_gt += len(true[name]["bbox"])  # Number of ground truth objects
+        n_p += len(preds[name]["bbox"])  # Number of predicted objects
+
+    print(n_gt,n_p)
+     
+                
+    model_scores = get_model_scores(preds)
+    scores = np.array(list(model_scores.keys()))
+    sorted_scores_indices = np.argsort(scores)[::-1]
+    sorted_scores = scores[sorted_scores_indices]
+        
+    for score in tqdm(sorted_scores,"Computing ap"):
+        
+        pred_tp = model_scores[score]["tp"]
+
+            # Create Precision-Recall curve and compute AP for each class
+            
+        for tp in pred_tp:
+
+            if n_p == 0 and n_gt == 0:
+                continue
+            elif n_p == 0 or n_gt == 0:
+                ap.append(0)
+                r.append(0)
+                p.append(0)
+            else:
+                # Accumulate FPs and TPs
+                fpc += (1 - tp)
+                tpc += (tp)
+
+                # Recall
+                recall_curve = tpc / (n_gt)
+                r.append(recall_curve)
+
+                # Precision
+                precision_curve = tpc / (tpc+fpc+eps)
+                p.append(precision_curve)
+
+                # AP from recall-precision curve
+                ap.append(compute_ap(r, p))
+
+    # Compute F1 score (harmonic mean of precision and recall)
+    plt.plot(r,p)
+    p, r, ap = np.array(p), np.array(r), np.array(ap)
+    f1 = (2 * p * r) / (p + r + 1e-16)
+
+    return p, r, ap[-1]*100, f1[-1]
+
+
+
+def compute_ap(recall, precision):
+    """ Compute the average precision, given the recall and precision curves.
+    Code originally from https://github.com/rbgirshick/py-faster-rcnn.
+    # Arguments
+        recall:    The recall curve (list).
+        precision: The precision curve (list).
+    # Returns
+        The average precision as computed in py-faster-rcnn.
+    """
+    # correct AP calculation
+    # first append sentinel values at the end
+    mrec = np.concatenate(([0.0], recall, [1.0]))
+    mpre = np.concatenate(([0.0], precision, [0.0]))
+
+    # compute the precision envelope
+    for i in range(mpre.size - 1, 0, -1):
+        mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
+
+    # to calculate area under PR curve, look for points
+    # where X axis (recall) changes value
+    i = np.where(mrec[1:] != mrec[:-1])[0]
+
+    # and sum (\Delta recall) * prec
+    ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
+    return ap
     
 
-def mAP(true,preds,thresh):
+
     
+def MAP():
     pass
     
-
+    
 
 def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", isSave = False, filename = "mobilenet"):
     since = datetime.datetime.now()

@@ -4,11 +4,13 @@ import cv2
 from utilsTorch import *
 from model import *
 
-def run(modelName,imagePath):
+def run(imagePath,backend = "mobilenet"):
     
+    fileName = f"yolo-back-{backend}-weights"
+   
     #Load model
-    model = YOLOv1(modelName)
-    model.load_state_dict(torch.load(f"trained/{modelName}"))
+    model = YOLOv1(backend)
+    model.load_state_dict(torch.load(f"trained/{fileName}"))
     model.eval()
     
     #Read and preprocess the image.
@@ -40,5 +42,5 @@ def run(modelName,imagePath):
 
 if __name__ == "__main__":
     print(sys.argv)
-    run(sys.argv[1],sys.argv[2])
+    run(*sys.argv[1:])
     

@@ -21,7 +21,10 @@ def run(imagePath,backend = "mobilenet"):
     
     #Generate annotations.
     preds = model(processedImage.unsqueeze(0)/255).view(1,7,7,30).detach()
-    sample = {"image":processedImage,"annotation":preds.squeeze(0)}
+    preds_dict = toDict([imagePath],preds.cpu(),False)
+    supredd_preds = nonMaxSupress(preds_dict,0.7)
+    new_preds = toGrid(preds,supredd_preds,device = "cpu")
+    sample = {"image":processedImage,"annotation":new_preds.squeeze(0)}
     
     #Show the annotated image.
     def onTrackBar(val):

@@ -7,7 +7,7 @@ from torchvision import utils
 import datetime
 import copy
 from copy import deepcopy
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from time import sleep
 
 
@@ -58,8 +58,6 @@ def preProcessImage(image,newSize):
     resizedImage = resizeImage(image,newSize)
     
     return toTensor(resizedImage)
-
-
 
 
 
@@ -361,41 +359,6 @@ def iou_bb(boxA, boxB):
     return iou
 
 
-
-def iou_ybb(boxA,boxB):
-        
-    xy_A,wh_A = boxA[:2],boxA[2:]
-    xy_B,wh_B = boxB[:2],boxB[2:]
-    
-    intersect_wh = torch.maximum(torch.zeros_like(wh_A), (wh_A + wh_B)/2 - torch.abs(xy_A - xy_B) )
-    intersect_area = intersect_wh[0] * intersect_wh[1]
-    
-    true_area = wh_B[0] * wh_B[1]
-    pred_area = wh_A[0] * wh_A[1]
-    
-    union_area = pred_area + true_area - intersect_area+eps
-    iou = intersect_area / union_area
-    
-    return iou
-
-
-def iou_grid(gridA,gridB):
-      
-    xy_A,wh_A = gridA[0],gridA[1]
-    xy_B,wh_B = gridB[0],gridB[1]
-            
-    intersect_wh = torch.maximum(torch.zeros_like(wh_A), (wh_A + wh_B)/2 - torch.abs(xy_A - xy_B) )
-    intersect_area = intersect_wh[:,:,:,:,0] * intersect_wh[:,:,:,:,1]
-    
-    true_area = wh_B[:,:,:,:,0] * wh_B[:,:,:,:,1]
-    pred_area = wh_A[:,:,:,:,0] * wh_A[:,:,:,:,1]
-    
-    union_area = pred_area + true_area - intersect_area+eps
-    iou = intersect_area / union_area
-    
-    return iou
-
-
 def bbox_iou(box1, box2, x1y1x2y2=True):
     """
     Returns the IoU of two bounding boxes
@@ -429,8 +392,6 @@ def bbox_iou(box1, box2, x1y1x2y2=True):
     iou = inter_area / (b1_area + b2_area - inter_area + 1e-16)
 
     return iou
-
-
 
 
 
@@ -471,10 +432,11 @@ def createLabels(data):
             
             r_box = [ymin,xmin,ymax,xmax]
             x, y, w, h = bbox2yolo([ymin,xmin,ymax,xmax])
-            x_n, y_n, w_n, h_n = normalizeYOLO([x, y, w, h],new_size[1],new_size[0])
             
             r = int(y/grid_size[0])
             c = int(x/grid_size[1])
+            
+            x_n, y_n, w_n, h_n = normalizeYOLO([x, y, w, h],grid_size[1]+(grid_size[1]*c),grid_size[0]+(grid_size[0]*r))
 
             b = np.argmin(Y[i,r,c,:,0])
             Y[i,r,c,b] = np.array([1,x_n,y_n,w_n,h_n,*labels])
@@ -490,6 +452,7 @@ def createLabels(data):
 def localizeAnnotations(image,annotations,thresh=0.5):
 
     h,w = image.shape[:2]
+    grid_size = tuple([int(s/no_grids) for s in new_size])
     
     for r in range(annotations.shape[0]):
         for c in range(annotations.shape[1]):
@@ -497,7 +460,7 @@ def localizeAnnotations(image,annotations,thresh=0.5):
             box2 = [*annotations[r,c,5:10]]
             
             conf = box1[0]
-            box = yolo2box(unnormalizeYOLO([*box1[1:5]],w,h),w,h)
+            box = yolo2box(unnormalizeYOLO([*box1[1:5]],grid_size[1]+(grid_size[1]*c),grid_size[0]+(grid_size[0]*r)),w,h)
             if box1[0] >= thresh:
                 obj = {}
                 obj["bndbox"] = box
@@ -508,7 +471,7 @@ def localizeAnnotations(image,annotations,thresh=0.5):
                 pass
                 #image = localizeBoxes(image,[box])
             conf = box2[0]
-            box = yolo2box(unnormalizeYOLO([*box2[1:5]],w,h),w,h)
+            box = yolo2box(unnormalizeYOLO([*box2[1:5]],grid_size[1]+(grid_size[1]*c),grid_size[0]+(grid_size[0]*r)),w,h)
             if box2[0] >= thresh:
                 obj = {}
                 obj["bndbox"] = box
@@ -589,9 +552,88 @@ def yoloLoss(labels,predictions,lambda_coords,lambda_noobj):
     noobj_conf_loss =  torch.sum(((real_conf-pred_conf)**2)*(1-real_conf))*lambda_noobj
     
     
-    return (obj_conf_loss+noobj_conf_loss+classes_loss+xy_loss+wh_loss) 
+    return (obj_conf_loss+noobj_conf_loss+classes_loss+xy_loss+wh_loss)/N 
     
 
+def nonMaxSupress(preds,iou_threshold = 0.7):
+    
+    
+    new_preds = preds.copy()
+    names = new_preds.keys()
+      
+    for name in tqdm(names,"Non Max Supressing ..."):
+      
+        sample = new_preds[name].copy()
+        
+        bbox = sample["bbox"]
+        scores = sample["scores"]
+        classes = sample["classes"]
+        indices = sample["indices"]
+        
+        new_bbox = []
+        new_scores = []
+        new_classes = []
+        new_indices = []
+        
+        sorted_scores_indices = np.argsort(scores)[::-1]
+        
+        sorted_scores = np.array(scores)[sorted_scores_indices].tolist()
+        sorted_bbox = np.array(bbox)[sorted_scores_indices].tolist()
+        sorted_classes = np.array(classes)[sorted_scores_indices].tolist()
+        sorted_indices = np.array(indices)[sorted_scores_indices].tolist()
+        
+        while(len(sorted_bbox)>0):
+            
+            if len(sorted_bbox) == 1:
+                new_bbox.append(sorted_bbox[0])
+                new_scores.append(sorted_scores[0])
+                new_classes.append(sorted_classes[0])
+                new_indices.append(sorted_indices[0])
+                break
+            
+            highest_bbox = sorted_bbox[0]
+
+            # Find the best matching target for our predicted box
+            iou = bbox_iou(torch.tensor(highest_bbox).unsqueeze(0), 
+                                                torch.tensor(sorted_bbox),False)
+
+            higher_indices = iou>=iou_threshold
+            lower_indices = iou<iou_threshold
+                        
+            higher_bbox = np.array(sorted_bbox)[higher_indices]
+            lower_bbox = np.array(sorted_bbox)[lower_indices]
+            
+
+            higher_scores = np.array(sorted_scores)[higher_indices]
+            lower_scores = np.array(sorted_scores)[lower_indices]
+
+            higher_classes = np.array(sorted_classes)[higher_indices]
+            lower_classes = np.array(sorted_classes)[lower_indices]
+            
+            higher_indices_arr = np.array(sorted_indices)[higher_indices]
+            lower_indices_arr = np.array(sorted_indices)[lower_indices]
+            
+                
+            new_bbox.append(higher_bbox[0].tolist())
+            new_scores.append(higher_scores[0].tolist())
+            new_classes.append(higher_classes[0].tolist())
+            new_indices.append(higher_indices_arr[0].tolist())
+            
+            
+            sorted_bbox = lower_bbox.tolist()
+            sorted_scores = lower_scores.tolist()
+            sorted_classes = lower_classes.tolist()
+            sorted_indices = lower_indices_arr.tolist()
+        
+        sample["bbox"] = new_bbox
+        sample["scores"] = new_scores
+        sample["classes"] = new_classes
+        sample["indices"] = new_indices
+        
+        new_preds[name] = sample
+    
+    return new_preds    
+    
 
 def toDict(names,boxes,isGroundTruth = False,defaultDict = None):
     
@@ -605,15 +647,61 @@ def toDict(names,boxes,isGroundTruth = False,defaultDict = None):
     
     
     for n in range(N):
+        r = 0
+        c = 0
+        b = 0
         for i in range(R*C*2):
+            
+            if b == 2:
+                c += 1
+                b = 0
+            if c == 7:
+                r += 1
+                c = 0
+            if r == 7:
+                r = 0
+                        
             if names[n] not in dic:
-                dic[names[n]] = {"bbox":[],"scores":[],"classes":[]}
+                dic[names[n]] = {"bbox":[],"scores":[],"classes":[],"indices":[]}
             if (isGroundTruth and bbox[n,i,0] == 1) or not isGroundTruth:
                 dic[names[n]]["scores"].append(bbox[n,i,0].tolist())
                 dic[names[n]]["bbox"].append(bbox[n,i,1:].tolist())
                 dic[names[n]]["classes"].append(np.argmax(classes[n,i//2]))
+                dic[names[n]]["indices"].append([n,r,c,b])
+            b += 1
+            
     return dic
+
+
+def toGrid(grid,dic,device):
     
+    N,R,C,D = grid.shape
+    new_grid = torch.zeros_like(grid)
+    names = dic.keys()
+    
+    for name in names:
+        
+        sample = dic[name]
+        
+        bbox = sample["bbox"]
+        scores = sample["scores"]
+        classes = sample["classes"]
+        indices = sample["indices"]
+        
+        for i in range(len(bbox)):
+            box = bbox[i]
+            score = scores[i]
+            class_pred = classes[i]
+            n,r,c,b = indices[i]
+            
+            new_grid[n,r,c,b*5] = score
+            new_grid[n,r,c,(1+(b*5)):(5+(b*5))] = torch.tensor(box)
+            new_grid[n,r,c,(10+class_pred)] = 1
+            
+    return new_grid.to(device)
+    
+    
+
 
 def get_model_scores(pred_boxes):
     """Creates a dictionary of from model_scores to image ids.
@@ -645,7 +733,7 @@ def get_batch_statistics(outputs, targets, iou_threshold = 0.5):
     """ Compute true positives, predicted scores and predicted labels per sample """
     batch_metrics = []
     names = targets.keys()
-    for name in names:
+    for name in tqdm(names,"calculating true positive rate"):
 
         if outputs[name] is None:
             continue
@@ -663,6 +751,7 @@ def get_batch_statistics(outputs, targets, iou_threshold = 0.5):
         
 
         true_positives = np.zeros(len(pred_boxes_sorted))
+        outputs[name]["tp"] = true_positives
 
         annotations = targets[name]
         target_labels = annotations["classes"]
@@ -702,7 +791,7 @@ def get_batch_statistics(outputs, targets, iou_threshold = 0.5):
     return outputs  
 
 
-def ap(true,preds):
+def AP(true,preds):
     """ Compute the average precision, given the recall and precision curves.
     Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
     # Arguments
@@ -723,8 +812,6 @@ def ap(true,preds):
     for name in true.keys():
         n_gt += len(true[name]["bbox"])  # Number of ground truth objects
         n_p += len(preds[name]["bbox"])  # Number of predicted objects
-
-    print(n_gt,n_p)
      
                 
     model_scores = get_model_scores(preds)
@@ -734,33 +821,24 @@ def ap(true,preds):
         
     for score in tqdm(sorted_scores,"Computing ap"):
         
-        pred_tp = model_scores[score]["tp"]
+        preds_tp = model_scores[score]["tp"]
+        
+        for tp in preds_tp:
+     
+            # Accumulate FPs and TPs
+            fpc += (1 - tp)
+            tpc += (tp)
 
-            # Create Precision-Recall curve and compute AP for each class
-            
-        for tp in pred_tp:
+            # Recall
+            recall_curve = tpc / (n_gt)
+            r.append(recall_curve)
 
-            if n_p == 0 and n_gt == 0:
-                continue
-            elif n_p == 0 or n_gt == 0:
-                ap.append(0)
-                r.append(0)
-                p.append(0)
-            else:
-                # Accumulate FPs and TPs
-                fpc += (1 - tp)
-                tpc += (tp)
+            # Precision
+            precision_curve = tpc / (tpc+fpc+eps)
+            p.append(precision_curve)
 
-                # Recall
-                recall_curve = tpc / (n_gt)
-                r.append(recall_curve)
-
-                # Precision
-                precision_curve = tpc / (tpc+fpc+eps)
-                p.append(precision_curve)
-
-                # AP from recall-precision curve
-                ap.append(compute_ap(r, p))
+    # AP from recall-precision curve
+    ap.append(compute_ap(r, p))
 
     # Compute F1 score (harmonic mean of precision and recall)
     plt.plot(r,p)
@@ -805,14 +883,16 @@ def MAP():
     
     
 
-def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", isSave = False, filename = "mobilenet"):
+def train_model(model, trainLoaders, lossFn, optimizer, num_epochs=1, device = "cpu", isSave = False, filename = "yolo-weights",verbose = True,isSupress = False, supressThresh = 0.5):
     since = datetime.datetime.now()
     
     loss_train_history = []
     loss_val_history = []
 
     best_model_wts = copy.deepcopy(model.state_dict())
-    best_loss = float('inf')    
+    best_loss = float('inf')
+    prev_train_loss = 0
+    prev_val_loss = 0
 
 
     for epoch in range(num_epochs):
@@ -829,10 +909,14 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
             running_loss = 0.0
 
             # Iterate over data.
-            for i,data in enumerate(tqdm(trainLoaders[phase])):
-
+            for i,data in enumerate(tqdm(trainLoaders[phase],"Predicting ...")):
+                torch.cuda.empty_cache()
+                
+                names = data["name"]
                 inputs = data["image"].to(device)
                 labels = data["annotation"].to(device)
+                              
+    
 
                 # zero the parameter gradients
                 optimizer.zero_grad()
@@ -841,31 +925,46 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
 
                     # forward
                     outputs =  model(inputs/255).view(labels.shape)
-                    loss = yoloLoss(labels.float(),outputs.float(),5,0.5)
+                    
+                    if isSupress:
+                        preds_dict = toDict(names,outputs.cpu().detach(),False)
+                        new_preds_dict = nonMaxSupress(preds_dict,supressThresh)
+                        outputs = toGrid(outputs,new_preds_dict,device)
+                        outputs.requires_grad = True
+
+                    
+                    loss = lossFn(labels.float(),outputs.float(),5,0.5)
                     
                     if phase == "train":
                         loss.backward()
                         optimizer.step()
 
                 # statistics
-                running_loss += loss.item()
-                print(f' Iteration Loss: {loss.item()}')
-                
-                             
-            print(f"{phase} prev epoch Loss: {epoch_loss}")
-        
-            epoch_loss = running_loss / len(trainLoaders[phase])
-
-            print(f"{phase} next epoch Loss: {epoch_loss}")
+                running_loss += (loss.item()*len(inputs))
+                if verbose:
+                    print(f' Iteration Loss: {loss.item()*len(inputs)}')
             
+            epoch_loss = running_loss / len(trainLoaders[phase])
+            
+            if phase == "train":
+                            
+                print(f"{phase} prev epoch Loss: {prev_train_loss}")
+                prev_train_loss = epoch_loss
+                   
             if phase == "val":
+                
+                print(f"{phase} prev epoch Loss: {prev_val_loss}")
+                prev_val_loss = epoch_loss
                 
                 # deep copy the model
                 if epoch_loss<best_loss:
                     best_loss = epoch_loss
                     best_model_wts = copy.deepcopy(model.state_dict())
                     if isSave:
-                        torch.save(model.state_dict(), f"trained/{filename}")                
+                        torch.save(model.state_dict(), f"trained/{filename}")    
+                        
+            print(f"{phase} current epoch Loss: {epoch_loss}")
+
 
     print()
 
@@ -883,52 +982,46 @@ def train_model(model, trainLoaders, optimizer, num_epochs=1, device = "cpu", is
 
     
     
-def test_model(model, test_data, device = "cpu"):
+def evaluate_model(model, test_data, device = "cpu",iou_thresh = 0.5,isSupress = False, supressThresh = 0.5):
     since = datetime.datetime.now()
     
     model.eval()   # Set model to evaluate mode
 
-    running_loss = 0.0
     ap = 0.0
-    aps = 0.0
-    t_dict = {}
-    p_dict = {}
+    true_dict = {}
+    preds_dict = {}
     
     # Iterate over data.
-    for i,data in enumerate(tqdm(test_data)):
-        
+    for i,data in enumerate(tqdm(test_data,"Predicting ...")):
+
         names = data["name"]
         inputs = data["image"].to(device)
         labels = data["annotation"].to(device)
 
         # forward
         outputs =  model(inputs/255).view(labels.shape)
-        loss = yoloLoss(labels.float(),outputs.float(),5,0.5)
-        
-        t_dict = toDict(names,labels,True,t_dict)
-        p_dict = toDict(names,outputs,False,p_dict)
-        
-        #ap = AP(t_dict,p_dict)["ap"]
-        
-        # statistics
-        running_loss += loss.item()
-        #aps += ap
-        print(f' Iteration Loss: {loss.item()}')
-                             
-                    
-    epoch_loss = running_loss / len(test_data)
-    #ap = aps / len(test_data)
 
-    print(f" Final Loss: {epoch_loss} , Final Average Precision : {ap}")
-          
+        true_dict = toDict(names,labels.cpu(),True,true_dict)
+        preds_dict = toDict(names,outputs.detach().cpu(),False,preds_dict)
+               
+    if isSupress:
+        preds_dict = nonMaxSupress(preds_dict,iou_threshold = supressThresh)
+    
+    new_preds_dict = get_batch_statistics(preds_dict,true_dict,iou_thresh)
+    
+    result = AP(true_dict,new_preds_dict)
+    ap = round(result[2],2)
+    
+
+    print(f" Average Precision : {ap}%")
 
     print()
 
     time_elapsed = (datetime.datetime.now() - since).total_seconds()
-    print('Training complete in {:.0f}m {:.0f}s'.format(
+    print('Evaluating complete in {:.0f}m {:.0f}s'.format(
         time_elapsed // 60, time_elapsed % 60))
         
-    return epoch_loss,(t_dict,p_dict)
+    return ap
 
     
     
